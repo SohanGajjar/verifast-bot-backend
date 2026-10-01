@@ -3,6 +3,8 @@
 - POST /events                                  ← channel-integration gateway
   New DMs / comments trigger the configured auto-replies in the background
   (see auto_reply.py); every attempt is persisted in auto_replies.
+  A customer's edit of a DM (is_edit) updates that message in place and keeps
+  the earlier version — no reply (see message_edits.py).
 - GET  /chat/instagram/<index>/channel-check    → frontend: show the Instagram inbox
 - GET  /chat/instagram/<index>/sessions         → frontend: conversation list
 - GET  /chat/history/<index>/<session_id>       → frontend: messages in a conversation
@@ -11,9 +13,15 @@
 - POST /chat/instagram/<index>/<session_id>/reply-comment          {text, comment_id?}
 - POST /chat/instagram/<index>/<session_id>/private-reply          {text, comment_id?}
 - POST /chat/instagram/<index>/<session_id>/comments/<id>/hide|unhide
-- DELETE /chat/instagram/<index>/<session_id>/comments/<id>
+- DELETE /chat/instagram/<index>/<session_id>/comments/<instagram comment id>
+- PUT    /chat/instagram/<index>/<session_id>/messages/<id>        {text}
+  Edit a public comment reply (posts a replacement, deletes the original).
+- DELETE /chat/instagram/<index>/<session_id>/messages/<id>
+  Delete a public comment reply or the customer's comment from Instagram.
   Outbound actions go through InstagramService → gateway /actions/*; replies
   are stored as actor "agent". comment_id defaults to the session's latest.
+  Platform windows are enforced (422) and one private reply per comment (409)
+  — see reply_actions.py.
 - GET    /chat/instagram/<index>/reply-configs[?type=dm|comment]
 - POST   /chat/instagram/<index>/reply-configs        {type, received?, reply?, comment_reply?}
 - PUT    /chat/instagram/<index>/reply-configs/<id>   {type?, received?, reply?, comment_reply?}
@@ -24,9 +32,16 @@
   reply DM — null means public reply only, no DM.
 - GET    /chat/instagram/<index>/auto-replies[?session_id=&status=]
   Sent / skipped / failed auto-replies, newest first.
+- POST   /chat/instagram/<index>/<session_id>/hold   {holder_email}
+  Take over the session (or transfer it). The bot skips auto-replies until release.
+- DELETE /chat/instagram/<index>/<session_id>/hold
+  Release the session. Messages that arrived during the hold are not answered.
+- GET    /api/admin/instagram-assets?index_name=   posts seen in conversations
+- GET    /api/admin/instagram-assets/<type>/<id>?index_name=
+- GET    /internal/filter-options/<index>/productNames   (empty: no catalogue)
 
 Data lives in app.db (chat_history, webhook_events, reply_configs,
-auto_replies) — see database.py.
+auto_replies, reply_edits, message_edits, session_holds) — see database.py.
 
 Run with the gateway's venv (it already has flask + flask-cors):
     /tmp/ci-venv/bin/python app.py
@@ -45,6 +60,8 @@ from flask_cors import CORS
 import auto_reply
 import database
 import logging_service
+import message_edits
+import reply_actions
 from instagram_service import InstagramService, InstagramServiceError
 
 log = logging_service.get_logger("bot_backend.app")
@@ -65,8 +82,6 @@ db = database.connect()
 # single worker with its own connection, so sends are serialized.
 auto_reply_db = database.connect()
 auto_reply_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="auto-reply")
-# Ids needed to act on a session.
-TARGET_COLUMNS = ("account_id", "conversation_id", "comment_id", "post_id")
 
 
 def _now():
@@ -76,10 +91,10 @@ def _now():
 def _record_webhook(em, meta, status):
     db.execute(
         "INSERT INTO webhook_events (request_id, index_name, session_id, event_type, status, "
-        "payload, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "payload, received_at, zernio_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (em.get("requestId"), em.get("index_name") or meta.get("index_name"),
          meta.get("session_id"), meta.get("instagram_event_type"), status,
-         request.get_data(as_text=True), _now()),
+         request.get_data(as_text=True), _now(), meta.get("zernio_event_id") or None),
     )
     db.commit()
 
@@ -98,6 +113,8 @@ def events():
         "conversation_id": meta.get("instagram_conversation_id"),
         "comment_id": meta.get("instagram_comment_id"),
         "post_id": meta.get("instagram_post_id"),
+        "message_id": meta.get("instagram_message_id"),
+        "zernio_event_id": meta.get("zernio_event_id"),
         "username": meta.get("customer_username"),
         "text": logging_service.truncate(meta.get("user_query")),
     }
@@ -106,15 +123,22 @@ def events():
                             extra={**event, "outcome": "ignored"})
         _record_webhook(em, meta, "ignored")
         return jsonify({"status": "ignored"}), 400
+    if meta.get("is_edit"):
+        return _apply_edit(em, meta, event)
+    if event["event_type"] == "dm" and not event["message_id"]:
+        webhook_log.warning("Webhook DM has no message id: duplicates of it cannot be detected",
+                            extra=event)
+    # A duplicate delivery hits the unique message / comment index and is ignored.
     cur = db.execute(
         "INSERT OR IGNORE INTO chat_history (request_id, index_name, session_id, actor, text, "
-        "event_type, username, created_at, account_id, conversation_id, comment_id, post_id) "
-        "VALUES (?, ?, ?, 'customer', ?, ?, ?, ?, ?, ?, ?, ?)",
+        "event_type, username, created_at, account_id, conversation_id, comment_id, post_id, "
+        "message_id) VALUES (?, ?, ?, 'customer', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (em.get("requestId"), em.get("index_name") or meta.get("index_name"),
          meta["session_id"], meta.get("user_query", ""), meta.get("instagram_event_type"),
          meta.get("customer_username", ""), _now(),
          meta.get("instagram_account_id", ""), meta.get("instagram_conversation_id", ""),
-         meta.get("instagram_comment_id", ""), meta.get("instagram_post_id", "")),
+         meta.get("instagram_comment_id", ""), meta.get("instagram_post_id", ""),
+         meta.get("instagram_message_id") or None),
     )
     db.commit()
     outcome = "stored" if cur.rowcount else "duplicate"
@@ -123,7 +147,15 @@ def events():
                      extra={**event, "outcome": outcome})
     if outcome == "stored":
         auto_reply_worker.submit(_auto_reply, event["index_name"], meta, em.get("requestId"))
-    return jsonify({"status": "stored"})
+    return jsonify({"status": outcome})
+
+
+def _apply_edit(em, meta, event):
+    status, row = message_edits.apply_edit(db, event["index_name"], meta, em.get("requestId"))
+    _record_webhook(em, meta, status)
+    webhook_log.info("Webhook edit %s: %s", status, event["event_type"], extra={
+        **event, "outcome": status, "history_id": row["id"] if row else None})
+    return jsonify({"status": status})
 
 
 def _auto_reply(index_name, meta, request_id):
@@ -144,11 +176,12 @@ def sessions(index_name):
     start = request.args.get("startDate", "0000")
     end = request.args.get("endDate", "9999")
     rows = db.execute(
-        "SELECT m.*, s.first_id FROM chat_history m JOIN ("
+        "SELECT m.*, s.first_id, h.holder_email FROM chat_history m JOIN ("
         "  SELECT session_id, MIN(id) AS first_id, MAX(id) AS last_id FROM chat_history"
         "  WHERE index_name = ? GROUP BY session_id) s ON m.id = s.last_id "
+        "LEFT JOIN session_holds h ON h.index_name = ? AND h.session_id = m.session_id "
         "WHERE m.created_at BETWEEN ? AND ? ORDER BY m.id DESC",
-        (index_name, start, end),
+        (index_name, index_name, start, end),
     ).fetchall()
     return jsonify({"sessions": [{
         "session_id": r["session_id"],
@@ -160,6 +193,7 @@ def sessions(index_name):
         "ig_event_type": r["event_type"],
         "instagram_user_id": r["username"] or None,
         "asset": None,
+        "holder_email": r["holder_email"],
         "last_message_preview": r["text"][:140],
         "last_message_at": r["created_at"],
         "last_message_actor": r["actor"],
@@ -169,20 +203,55 @@ def sessions(index_name):
     } for r in rows]})
 
 
-HISTORY_COLUMNS = (
-    "id, actor, text, index_name, session_id AS session, created_at, event_type, reply_kind, "
-    "comment_id"
-)
-
-
 @app.get("/chat/history/<index_name>/<session_id>")
 def history(index_name, session_id):
     rows = db.execute(
-        f"SELECT {HISTORY_COLUMNS} FROM chat_history "
+        f"SELECT {reply_actions.HISTORY_COLUMNS} FROM chat_history "
         "WHERE index_name = ? AND session_id = ? ORDER BY id", (index_name, session_id),
     ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    return jsonify(message_edits.attach_edit_history(db, index_name, [dict(r) for r in rows]))
 
+
+@app.get("/internal/filter-options/<index_name>/productNames")
+def product_names(index_name):
+    """Chat filter popup's product list — this backend has no product catalogue."""
+    return jsonify({"productNames": []})
+
+
+def _asset(row):
+    return {"index_name": row["index_name"], "asset_id": row["post_id"], "asset_type": "post",
+            "post_id": row["post_id"], "account_id": row["account_id"] or "",
+            "first_seen_at": row["first_seen_at"], "last_seen_at": row["last_seen_at"]}
+
+
+ASSET_SQL = (
+    "SELECT index_name, post_id, MAX(account_id) AS account_id, MIN(created_at) AS first_seen_at, "
+    "MAX(created_at) AS last_seen_at FROM chat_history WHERE index_name = ? "
+    "AND post_id IS NOT NULL AND post_id != ''"
+)
+
+
+@app.get("/api/admin/instagram-assets")
+def list_assets():
+    """Posts that have comments — the only assets this backend knows (no media / caption)."""
+    index_name = request.args.get("index_name", "")
+    if request.args.get("asset_type") not in (None, "", "post"):
+        return jsonify({"items": [], "total_count": 0, "limit": 0, "offset": 0})
+    limit = min(int(request.args.get("limit", 200)), 200)
+    offset = int(request.args.get("offset", 0))
+    rows = db.execute(ASSET_SQL + " GROUP BY index_name, post_id ORDER BY last_seen_at DESC",
+                      (index_name,)).fetchall()
+    return jsonify({"items": [_asset(r) for r in rows[offset:offset + limit]],
+                    "total_count": len(rows), "limit": limit, "offset": offset})
+
+
+@app.get("/api/admin/instagram-assets/<asset_type>/<asset_id>")
+def get_asset(asset_type, asset_id):
+    row = db.execute(ASSET_SQL + " AND post_id = ? GROUP BY index_name, post_id",
+                     (request.args.get("index_name", ""), asset_id)).fetchone()
+    if asset_type != "post" or not row:
+        return jsonify({"error": "asset not found"}), 404
+    return jsonify(_asset(row))
 
 
 @app.errorhandler(InstagramServiceError)
@@ -191,6 +260,12 @@ def instagram_error(e):
         "kind": "gateway_error", "status_code": e.status_code,
         "details": logging_service.body_for_log(e.body)})
     return jsonify({"error": str(e), "status_code": e.status_code, "details": e.body}), 502
+
+
+@app.errorhandler(reply_actions.ActionError)
+def action_error(e):
+    log.warning("Action rejected: %s", e, extra={"kind": "action_error", "status": e.status})
+    return jsonify({"error": str(e)}), e.status
 
 
 @app.errorhandler(ValueError)
@@ -217,22 +292,44 @@ def _text():
     return text
 
 
-def _record_agent(target, text, reply_kind):
-    cur = db.execute(
-        "INSERT INTO chat_history (index_name, session_id, actor, text, event_type, username, "
-        "created_at, account_id, conversation_id, comment_id, post_id, reply_kind) "
-        "VALUES (?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (target["index_name"], target["session_id"], text, target["event_type"],
-         target["username"], _now(),
-         *(target[c] for c in TARGET_COLUMNS), reply_kind),
-    )
-    db.commit()
-    return dict(db.execute(
-        f"SELECT {HISTORY_COLUMNS} FROM chat_history WHERE id = ?", (cur.lastrowid,)).fetchone())
+def _record_agent(target, text, reply_kind, result):
+    return reply_actions.record_outbound(db, target, "agent", text, reply_kind,
+                                         auto_reply.reply_id_from(result))
 
 
 def _not_found(what):
     return jsonify({"error": f"no {what} found for this session"}), 404
+
+
+def _hold_body(index_name, session_id):
+    row = db.execute(
+        "SELECT holder_email, created_at, updated_at FROM session_holds "
+        "WHERE index_name = ? AND session_id = ?", (index_name, session_id)).fetchone()
+    if not row:
+        return None
+    return {"index_name": index_name, "session_id": session_id,
+            "holder_email": row["holder_email"], "created_at": row["created_at"],
+            "updated_at": row["updated_at"]}
+
+
+@app.post("/chat/instagram/<index_name>/<session_id>/hold")
+def take_hold(index_name, session_id):
+    email = ((request.get_json(silent=True) or {}).get("holder_email") or "").strip()
+    if not email:
+        return jsonify({"error": "holder_email is required"}), 400
+    auto_reply.take_hold(db, index_name, session_id, email, _now())
+    log.info("Session taken over", extra={"kind": "hold", "outcome": "held",
+                                          "index_name": index_name, "session_id": session_id,
+                                          "holder_email": email})
+    return jsonify(_hold_body(index_name, session_id))
+
+
+@app.delete("/chat/instagram/<index_name>/<session_id>/hold")
+def release_hold(index_name, session_id):
+    auto_reply.release_hold(db, index_name, session_id)
+    log.info("Session released", extra={"kind": "hold", "outcome": "released",
+                                        "index_name": index_name, "session_id": session_id})
+    return jsonify({"status": "released", "index_name": index_name, "session_id": session_id})
 
 
 @app.get("/chat/instagram/<index_name>/<session_id>/context")
@@ -254,8 +351,9 @@ def send_message(index_name, session_id):
     target = _latest(index_name, session_id, "conversation_id")
     if not target:
         return _not_found("DM conversation")
+    reply_actions.check_window(db, "dm", target)
     result = ig.send_msg(target["conversation_id"], text, account_id=target["account_id"])
-    return jsonify({"status": "sent", "message": _record_agent(target, text, "dm"),
+    return jsonify({"status": "sent", "message": _record_agent(target, text, "dm", result),
                     "result": result})
 
 
@@ -266,8 +364,11 @@ def reply_comment(index_name, session_id):
     target = _latest(index_name, session_id, "comment_id", comment_id)
     if not target:
         return _not_found("comment")
+    if target["deleted_at"]:
+        raise reply_actions.ActionError("this comment was deleted", 409)
     result = ig.reply_comment(target["comment_id"], text, account_id=target["account_id"])
-    return jsonify({"status": "sent", "message": _record_agent(target, text, "comment_reply"),
+    return jsonify({"status": "sent",
+                    "message": _record_agent(target, text, "comment_reply", result),
                     "result": result})
 
 
@@ -278,10 +379,8 @@ def private_reply(index_name, session_id):
     target = _latest(index_name, session_id, "comment_id", comment_id)
     if not target:
         return _not_found("comment")
-    result = ig.private_reply(target["post_id"], target["comment_id"], text,
-                              account_id=target["account_id"])
-    return jsonify({"status": "sent", "message": _record_agent(target, text, "private_reply"),
-                    "result": result})
+    message, result = reply_actions.send_private_reply(db, ig, target, text)
+    return jsonify({"status": "sent", "message": message, "result": result})
 
 
 @app.post("/chat/instagram/<index_name>/<session_id>/comments/<comment_id>/<action>")
@@ -299,11 +398,20 @@ def moderate_comment(index_name, session_id, comment_id, action):
 
 @app.delete("/chat/instagram/<index_name>/<session_id>/comments/<comment_id>")
 def delete_comment(index_name, session_id, comment_id):
-    target = _latest(index_name, session_id, "comment_id", comment_id)
-    if not target:
-        return _not_found("comment")
-    result = ig.delete_comment(comment_id, account_id=target["account_id"])
-    return jsonify({"status": "deleted", "comment_id": comment_id, "result": result})
+    """Delete by Instagram comment id — the customer's comment or a reply's reply_id."""
+    message_id = reply_actions.find_comment_message(db, index_name, session_id, comment_id)
+    return jsonify(reply_actions.delete_message(db, ig, index_name, session_id, message_id))
+
+
+@app.put("/chat/instagram/<index_name>/<session_id>/messages/<int:message_id>")
+def edit_message(index_name, session_id, message_id):
+    result = reply_actions.edit_reply(db, ig, index_name, session_id, message_id, _text())
+    return jsonify(result), 207 if result["status"] == "partial" else 200
+
+
+@app.delete("/chat/instagram/<index_name>/<session_id>/messages/<int:message_id>")
+def delete_message(index_name, session_id, message_id):
+    return jsonify(reply_actions.delete_message(db, ig, index_name, session_id, message_id))
 
 
 def _reply_config_fields(body, current=None):

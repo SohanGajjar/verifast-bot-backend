@@ -99,6 +99,24 @@ def _record_webhook(em, meta, status):
     db.commit()
 
 
+@app.get("/")
+def root():
+    """Browser-friendly index — the API has no HTML UI; use the admin app on :3000."""
+    return jsonify({
+        "service": "bot-backend",
+        "status": "ok",
+        "health": "/health",
+        "ingest": "POST /events",
+        "admin_ui": "http://localhost:3000/admin/chats",
+        "example": "/chat/instagram/demo-store/channel-check",
+    })
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
 @app.post("/events")
 def events():
     em = (request.get_json(silent=True) or {}).get("event_metadata") or {}
